@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Label Cropper</title>
+  <style>
+    :root { font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Inter,Helvetica,Arial,sans-serif; }
+    body { margin: 0; padding: 16px; background: #f7f7f9; }
+    h1 { font-size: 20px; margin: 0 0 12px; }
+    .card { background: #fff; border-radius: 12px; padding: 16px; box-shadow: 0 2px 10px rgba(0,0,0,.06); }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+    button,input[type="file"]::file-selector-button { font-size: 16px; padding: 10px 14px; border-radius: 10px; border: 1px solid #ddd; background: #fff; }
+    button.primary { background: #0a84ff; color: white; border: none; }
+    button:disabled { opacity: .5; }
+    #log { font-size: 12px; color: #555; white-space: pre-wrap; }
+    #preview { width: 100%; max-height: 60vh; border: 1px solid #e5e5ea; border-radius: 8px; background: #fff; display: block; }
+    .hint { font-size: 12px; color:#666; }
+  </style>
+  <!-- PDF.js (render) -->
+  <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.min.js"></script>
+  <script>pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.worker.min.js";</script>
+  <!-- pdf-lib (edit crop box) -->
+  <script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+</head>
+<body>
+  <div class="card">
+    <h1>Label Cropper (Web)</h1>
+    <div class="row">
+      <input id="file" type="file" accept="application/pdf">
+      <button id="cropBtn" class="primary" disabled>Auto‑Crop</button>
+      <button id="downloadBtn" disabled>Download Cropped PDF</button>
+      <button id="openBtn" disabled>Open / Print</button>
+    </div>
+    <div class="hint">Workflow: Pick PDF → Auto‑Crop → Open/Print (AirPrint from Safari’s Share → Print).</div>
+  </div>
+
+  <div style="height:12px"></div>
+  <canvas id="preview"></canvas>
+  <div id="log"></div>
+
+<script>
+const fileInput = document.getElementById('file');
+const cropBtn = document.getElementById('cropBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+const openBtn = document.getElementById('openBtn');
+const preview = document.getElementById('preview');
+const log = document.getElementById('log');
+
+let originalBytes = null;
+let croppedBlob = null;
+
+// Simple logger
+function info(msg){ log.textContent = msg; }
+function add(msg){ log.textContent += "\\n" + msg; }
+
+fileInput.addEventListener('change', async (e) => {
+  const file = e.target.files?.[0];
+  if(!file) return;
+  info("Loading PDF...");
+  originalBytes = await file.arrayBuffer();
+  await renderFirstPage(originalBytes); // show original
+  cropBtn.disabled = false;
+  downloadBtn.disabled = true;
+  openBtn.disabled = true;
+});
+
+async function renderFirstPage(bytes, cropBox=null) {
+  const pdf = await pdfjsLib.getDocument({data: bytes}).promise;
+  const page = await pdf.getPage(1);
+  const scale = 2.0;
+  const viewport = page.getViewport({ scale });
+  const ctx = preview.getContext('2d');
+  preview.width = viewport.width | 0;
+  preview.height = viewport.height | 0;
+  await page.render({ canvasContext: ctx, viewport }).promise;
+
+  // Draw visual crop overlay if provided
+  if (cropBox) {
+    const { x, y, w, h } = cropBox; // normalized 0..1 with origin bottom-left
+    ctx.save();
+    ctx.strokeStyle = '#0a84ff';
+    ctx.lineWidth = 3;
+    const rx = x * preview.width;
+    const ry = (1 - (y + h)) * preview.height; // convert to canvas origin top-left
+    const rw = w * preview.width;
+    const rh = h * preview.height;
+    ctx.strokeRect(rx, ry, rw, rh);
+    ctx.restore();
+  }
+}
+
+function findNonWhiteBBox(ctx, w, h, thresh=245) {
+  const img = ctx.getImageData(0, 0, w, h).data;
+  let minX=w, minY=h, maxX=0, maxY=0, found=false;
+  for (let y=0; y<h; y++) {
+    for (let x=0; x<w; x++) {
+      const i = (y*w + x) * 4;
+      const r=img[i], g=img[i+1], b=img[i+2];
+      if (!(r>thresh && g>thresh && b>thresh)) {
+        if (x<minX) minX=x; if (y<minY) minY=y;
+        if (x>maxX) maxX=x; if (y>maxY) maxY=y;
+        found=true;
+      }
+    }
+  }
+  if (!found) return null;
+  return { x:minX, y:minY, w:maxX-minX, h:maxY-minY };
+}
+
+cropBtn.addEventListener('click', async () => {
+  if(!originalBytes) return;
+  info("Detecting content area...");
+  const pdf = await pdfjsLib.getDocument({data: originalBytes}).promise;
+  const page = await pdf.getPage(1);
+  const scale = 2.0;
+  const viewport = page.getViewport({ scale });
+  const tmp = document.createElement('canvas');
+  tmp.width = viewport.width | 0;
+  tmp.height = viewport.height | 0;
+  const tctx = tmp.getContext('2d');
+  await page.render({ canvasContext: tctx, viewport }).promise;
+
+  const box = findNonWhiteBBox(tctx, tmp.width, tmp.height);
+  if (!box) { add("\\nCould not detect content; leaving as-is."); return; }
+  // normalized bbox in PDF coords (origin bottom-left)
+  const nx = box.x / tmp.width;
+  const nyTop = box.y / tmp.height;
+  const nw = box.w / tmp.width;
+  const nh = box.h / tmp.height;
+  const ny = 1 - (nyTop + nh);
+  const bbox = { x:nx, y:ny, w:nw, h:nh };
+
+  add("Cropping…");
+  // Apply to all pages with pdf-lib
+  const pdfDoc = await PDFLib.PDFDocument.load(originalBytes);
+  const pages = pdfDoc.getPages();
+  const pad = 0.01; // tiny padding
+  for (const p of pages) {
+    const { width, height } = p.getSize();
+    const left = Math.max(0, (bbox.x - pad) * width);
+    const bottom = Math.max(0, (bbox.y - pad) * height);
+    const right = Math.min(width, (bbox.x + bbox.w + pad) * width);
+    const top = Math.min(height, (bbox.y + bbox.h + pad) * height);
+    p.setCropBox(left, bottom, right - left, top - bottom);
+    // Optionally also clamp MediaBox so some printers respect the size:
+    // p.setMediaBox(left, bottom, right - left, top - bottom);
+  }
+  const outBytes = await pdfDoc.save();
+  croppedBlob = new Blob([outBytes], { type: "application/pdf" });
+
+  // show preview overlay on first page
+  await renderFirstPage(originalBytes, bbox);
+  info("Done. Tap “Open / Print” to AirPrint, or Download.");
+  downloadBtn.disabled = false;
+  openBtn.disabled = false;
+});
+
+downloadBtn.addEventListener('click', () => {
+  if (!croppedBlob) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(croppedBlob);
+  a.download = 'label-cropped.pdf';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href), 2000);
+  a.remove();
+});
+
+openBtn.addEventListener('click', () => {
+  if (!croppedBlob) return;
+  const url = URL.createObjectURL(croppedBlob);
+  // iOS Safari: opening the PDF lets you use Share → Print (AirPrint)
+  window.open(url, '_blank');
+  setTimeout(()=>URL.revokeObjectURL(url), 30000);
+});
+</script>
+</body>
+</html>
